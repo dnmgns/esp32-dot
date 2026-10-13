@@ -7,6 +7,7 @@ import uuid
 
 import serial
 from serial.tools import list_ports
+import watcher_port
 from screenshot import save_capture
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -25,7 +26,7 @@ def drag(stream, direction):
 def main():
     health = mcp.call('get_device_status', {})
     assert health['connected'] and health['pending'] == 0, health
-    ports = [p.device for p in list_ports.comports() if p.vid == 0x303a and p.pid == 0x1001]
+    ports = watcher_port.candidates()
     assert len(ports) == 1, ports
     prefix = 'choices-smoke-' + uuid.uuid4().hex[:8]
     output = ROOT / '.tools/choices'

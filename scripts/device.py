@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Identify, flash, or monitor the one connected native ESP32 USB interface."""
+"""Identify, flash, or monitor the Watcher's ESP32-S3 serial port."""
 import argparse
 import getpass
 import json
@@ -12,14 +12,22 @@ import urllib.request
 
 import serial
 from serial.tools import list_ports
+import watcher_port
 from esptool.reset import HardReset
 from screenshot import save_capture
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
+PACED = False
+
+
 def run(*args):
-    subprocess.run([sys.executable, "-m", "esptool", "--chip", "esp32s3", *map(str, args)], check=True)
+    if PACED:
+        command = [sys.executable, str(ROOT / "scripts/esptool_paced.py"), "16"]
+    else:
+        command = [sys.executable, "-m", "esptool"]
+    subprocess.run([*command, "--chip", "esp32s3", *map(str, args)], check=True)
 
 
 def main():
@@ -28,17 +36,20 @@ def main():
     parser.add_argument("--port")
     parser.add_argument("--seconds", type=float, default=15)
     parser.add_argument("--reset", action="store_true")
+    parser.add_argument("--paced", action="store_true", help="flash with 16-byte paced writes and no stub (~6 min for the app); needed on the Watcher's serial bridge, see scripts/esptool_paced.py")
     parser.add_argument("--output", default=".tools/screenshot.png")
     parser.add_argument("--host", help="Mac's hostname (e.g. rmbm5.local) or LAN address")
     parser.add_argument("--ssid", help="2.4 GHz Wi-Fi network name")
     parser.add_argument("--tcp-port", type=int, default=8787)
     parser.add_argument("--via-bridge", action="store_true", help="Provision through the bridge that currently owns USB")
     args = parser.parse_args()
-    candidates = [p.device for p in list_ports.comports() if p.vid == 0x303A and p.pid == 0x1001]
+    global PACED
+    PACED = args.paced
+    candidates = watcher_port.candidates()
     port = args.port
     if not port:
         if len(candidates) != 1:
-            parser.error(f"Expected one ESP32 USB device, found {candidates}; specify --port")
+            parser.error(f"Expected one Watcher serial port, found {candidates}; specify --port")
         port = candidates[0]
 
     configuration = None
@@ -97,7 +108,8 @@ def main():
             parser.error("Partition table has no factory application partition")
         if firmware.stat().st_size > factory[1]:
             parser.error("Firmware exceeds the configured factory application partition")
-        run("--port", port, "write-flash", *flash_flags,
+        link = ["--no-stub", "--baud", "115200"] if args.paced else []
+        run("--port", port, *link, "write-flash", *flash_flags,
             "0x0", bootloader, "0x8000", partition, hex(factory[0]), firmware)
     else:
         # On native USB, these flags suppress PySerial's DTR/RTS writes at
@@ -110,7 +122,7 @@ def main():
                 # DTR must be deasserted while pulsing RTS for an app reset.
                 stream.dtr = False
                 stream.rts = False
-                HardReset(stream, uses_usb=True)()
+                HardReset(stream, uses_usb=False)()
             if configuration:
                 stream.reset_input_buffer()
                 stream.write(json.dumps(configuration, separators=(",", ":")).encode() + b"\n")

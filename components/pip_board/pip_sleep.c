@@ -7,13 +7,14 @@
 
 // A small opaque RGB565 tile keeps invalidation and rotation local to the blob.
 // No bitmap assets: evaluate the capsule and eye arcs in its rotating coordinates.
-enum { TILE_W = 128, TILE_H = 104, FLOOR = 360, MIN_X = 93, MAX_X = 355 };
+// Round 412x412 screen: the floor sits where the circle is still wide enough for the tile.
+enum { TILE_W = 128, TILE_H = 104, FLOOR = 316, MIN_X = 100, MAX_X = 312 };
 static uint16_t pixels[TILE_W * TILE_H];
 static uint16_t letters_small[18 * 34], letters_big[30 * 34];
 static lv_obj_t *blob, *zz, *big_z;
 static lv_timer_t *timer;
 static uint32_t epoch, frames, draw_us;
-static float x = 225, from_x, to_x;
+static float x = 206, from_x, to_x;
 static bool tumbling, repeat_tumble, frozen;
 static unsigned phase_ms;
 static float last_width, last_height, last_angle;
@@ -133,9 +134,9 @@ static void draw(unsigned ms)
         small_opacity = smooth(clamp(seconds * 2, 0, 1)) * smooth(clamp((2.3f - seconds) * 2, 0, 1));
         big_opacity = smooth(clamp((seconds - .5f) * 2, 0, 1)) * smooth(clamp((3 - seconds) * 2, 0, 1));
     }
-    int zx = (int)fminf(x + 52, 392);
-    lv_obj_set_pos(zz, zx, 272);
-    lv_obj_set_pos(big_z, zx + 18, 272);
+    int zx = (int)fminf(x + 52, 340);
+    lv_obj_set_pos(zz, zx, FLOOR - 88);
+    lv_obj_set_pos(big_z, zx + 18, FLOOR - 88);
     lv_obj_set_style_opa(zz, (lv_opa_t)lroundf(small_opacity * 255), 0);
     lv_obj_set_style_opa(big_z, (lv_opa_t)lroundf(big_opacity * 255), 0);
 }
@@ -143,7 +144,7 @@ static void draw(unsigned ms)
 static void begin_tumble(void)
 {
     from_x = x;
-    if (repeat_tumble) to_x = x < 224 ? MAX_X : MIN_X;
+    if (repeat_tumble) to_x = x < 206 ? MAX_X : MIN_X;
     else {
         // Uniformly choose from the allowed positions on either side, at
         // least 64px away. Near an edge this naturally favors moving inward.
@@ -189,7 +190,7 @@ void pip_sleep_stop(void)
 
 void pip_sleep_start(lv_obj_t *parent)
 {
-    x = 225;
+    x = 206;
     last_width = last_height = last_angle = -1;
     frames = 0;
     blob = lv_canvas_create(parent);
@@ -212,7 +213,7 @@ void pip_sleep_debug(bool repeat, int32_t seek_ms)
     repeat_tumble = repeat;
     frozen = seek_ms >= 0;
     tumbling = false;
-    x = 225;
+    x = 206;
     if (repeat) begin_tumble();
     epoch = lv_tick_get();
     draw(frozen ? (unsigned)seek_ms % (repeat ? 3001 : 9000) : 0);

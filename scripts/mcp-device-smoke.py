@@ -9,6 +9,7 @@ import uuid
 
 import serial
 from serial.tools import list_ports
+import watcher_port
 from pip_mcp import load_mcp_token
 from screenshot import save_capture
 
@@ -36,7 +37,7 @@ def main():
         time.sleep(0.5)
         health = call('get_device_status', {})
     assert health['connected'] and health['pending'] == 0, health
-    ports = [p.device for p in list_ports.comports() if p.vid == 0x303a and p.pid == 0x1001]
+    ports = watcher_port.candidates()
     assert len(ports) == 1, ports
     prefix = 'mcp-smoke-' + uuid.uuid4().hex[:8]
     output = ROOT / '.tools/mcp-smoke'

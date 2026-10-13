@@ -1,6 +1,7 @@
 #include "pip_board.h"
 #include "pip_assets.h"
 #include "pip_sleep.h"
+#include "pip_watcher.h"
 #include "esp_lvgl_port.h"
 #include "esp_err.h"
 #include "lvgl.h"
@@ -23,7 +24,26 @@ LV_FONT_DECLARE(inter_choice);
 LV_FONT_DECLARE(inter_confirm);
 LV_FONT_DECLARE(inter_arrows);
 LV_FONT_DECLARE(inter_check);
-enum { WIDTH = 448, HEIGHT = 368, BLUE = 0x0028b9, RED = 0xa44200 };
+// 412x412 round panel (SenseCAP Watcher). Layouts keep content inside the circle:
+// a text line at distance d from the centre can be at most 2*sqrt(206^2 - d^2) wide.
+// Message text uses a 290 px column; its top line (d = 140 px) has 302 px available.
+enum {
+    WIDTH = 412, HEIGHT = 412, CENTER = 206, BLUE = 0x0028b9, RED = 0xa44200,
+    TEXT_X = 61, TEXT_Y = 66, TEXT_W = 290,
+    // Choice button: a circle, centred a little above the pagination row.
+    CHOICE_D = 280, CHOICE_CY = 172, CHOICE_TEXT_W = 216, CHOICE_TEXT_H = 160,
+    // Confirm button circle and the plain dismiss button.
+    CONFIRM_D = 192, DISMISS_D = 128,
+    // Pagination row (dots or A/B/C), pitch 36, at most 7 slots.
+    ROW_CY = 332, ROW_SLOTS = 7,
+    // Edge zones for touch paging, and the tuning layout's inscribed square.
+    EDGE_L = 100, EDGE_R = 312,
+};
+// Tune review: Retry (top left), Exit (bottom left) and Submit (tall right) fill a
+// 290 px square; the rounded outer corners stay inside the circle.
+static const lv_area_t tune_boxes[3] = {
+    {61, 61, 199, 199}, {61, 212, 199, 350}, {212, 61, 350, 350},
+};
 static lv_obj_t *scene;
 static unsigned option_count;
 static char option_labels[3][65];
@@ -49,6 +69,9 @@ static char content[664];
 static uint16_t offsets[168];
 static unsigned pages, page;
 static bool error_card, submitted;
+static lv_group_t *dial_group;
+static bool dial_recording;
+static unsigned tune_focus;
 static void render_page(void);
 static void face(const char *name);
 
@@ -85,6 +108,12 @@ static lv_obj_t *mask(const lv_image_dsc_t *image, int x, int y, uint32_t color)
     lv_obj_set_style_image_recolor(obj, lv_color_hex(color), 0);
     lv_obj_set_style_image_recolor_opa(obj, LV_OPA_COVER, 0);
     return obj;
+}
+
+// Place an image so its centre is dx, dy from the middle of the round screen.
+static lv_obj_t *mask_center(const lv_image_dsc_t *image, int dx, int dy, uint32_t color)
+{
+    return mask(image, (WIDTH - (int)image->header.w) / 2 + dx, (HEIGHT - (int)image->header.h) / 2 + dy, color);
 }
 
 static void clear(uint32_t color)
@@ -130,53 +159,67 @@ static void face(const char *name)
     atomic_store(&audio_started, false);
     atomic_store(&audio_state, !strcmp(name, "listening") ? ((audio & ~3u) + 4) | 1 : audio & ~3u);
     snprintf(state, sizeof(state), "%s", name);
+    if (strcmp(name, "listening")) dial_recording = false;
     if (!strcmp(name, "idle")) {
         lv_timer_reset(idle_timer);
         lv_timer_resume(idle_timer);
     }
     if (*tune_id) {
         if (!strcmp(name, "tune_review") || !strcmp(name, "tune_wait")) {
-            box(scene, 24, 24, 188, 148, 0xffffff, 32);
-            box(scene, 24, 196, 188, 148, 0xffffff, 32);
-            box(scene, 236, 24, 188, 320, 0xffffff, 32);
-            lv_obj_t *label = text_at(scene, "Retry", 46, 112, 144, &inter_tune_label, 0);
-            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-            label = text_at(scene, "Exit", 46, 284, 144, &inter_tune_label, 0);
-            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-            label = text_at(scene, "Submit", 258, 198, 144, &inter_tune_label, 0);
-            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-            label = text_at(scene, "↻", 86, 54, 64, &inter_tune_retry, 0);
-            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-            label = text_at(scene, "×", 86, 221, 64, &inter_tune_exit, 0);
-            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-            label = text_at(scene, "✓", 298, 112, 64, &inter_tune_check, 0);
-            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+            static const char *const labels[3] = {"Retry", "Exit", "Submit"};
+            static const char *const icons[3] = {"↻", "×", "✓"};
+            const lv_font_t *icon_fonts[3] = {&inter_tune_retry, &inter_tune_exit, &inter_tune_check};
+            for (unsigned i = 0; i < 3; i++) {
+                const lv_area_t *a = &tune_boxes[i];
+                int w = lv_area_get_width(a), h = lv_area_get_height(a);
+                lv_obj_t *button = box(scene, a->x1, a->y1, w, h, 0xffffff, 32);
+                // The dial's focus ring; touch ignores it.
+                if (i == tune_focus && !strcmp(name, "tune_review")) {
+                    lv_obj_set_style_border_width(button, 8, 0);
+                    lv_obj_set_style_border_color(button, lv_color_hex(0x2d6bff), 0);
+                    lv_obj_set_style_border_opa(button, LV_OPA_COVER, 0);
+                }
+                // Tall Submit box: icon and label sit around its vertical centre.
+                int top = i == 2 ? a->y1 + h / 2 - 72 : a->y1 + 30;
+                int label_y = i == 2 ? a->y1 + h / 2 + 14 : a->y1 + 84;
+                lv_obj_t *icon = text_at(scene, icons[i], a->x1 + (w - 64) / 2, top, 64, icon_fonts[i], 0);
+                lv_obj_set_style_text_align(icon, LV_TEXT_ALIGN_CENTER, 0);
+                lv_obj_t *label = text_at(scene, labels[i], a->x1, label_y, w, &inter_tune_label, 0);
+                lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+            }
         } else {
-            lv_obj_t *label = text_at(scene, tune_phrase, 40, 40, 368, &inter_tune, 0xffffff);
+            lv_obj_t *label = text_at(scene, tune_phrase, TEXT_X, TEXT_Y, TEXT_W, &inter_tune, 0xffffff);
             lv_obj_set_style_text_line_space(label, 48 - inter_tune.line_height, 0);
-            // Figma's exported frame includes the recording dot. Its 242x202
-            // design-pixel bounds extend 9 px beyond each edge of the scene.
+            // Recording ring around the edge of the round screen, shown once audio starts.
             if (!strcmp(name, "listening")) {
-                tune_frame = mask(&pip_recording_frame, -18, -18, 0xff472a);
+                tune_frame = lv_obj_create(scene);
+                lv_obj_remove_style_all(tune_frame);
+                lv_obj_remove_flag(tune_frame, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_set_size(tune_frame, WIDTH, HEIGHT);
+                lv_obj_set_pos(tune_frame, 0, 0);
+                lv_obj_set_style_radius(tune_frame, LV_RADIUS_CIRCLE, 0);
+                lv_obj_set_style_border_width(tune_frame, 16, 0);
+                lv_obj_set_style_border_color(tune_frame, lv_color_hex(0xff472a), 0);
+                lv_obj_set_style_border_opa(tune_frame, LV_OPA_COVER, 0);
                 lv_obj_add_flag(tune_frame, LV_OBJ_FLAG_HIDDEN);
             }
         }
     } else if (!strcmp(name, "attention")) {
-        mask(&pip_face_attention, 104, 64, 0);
+        mask_center(&pip_face_attention, 0, 0, 0);
     } else if (!strcmp(name, "thinking")) {
-        mask(&pip_face_thinking, 104, 64, 0xffffff);
-        for (int i = 0; i < 3; i++) dot(312 + i * 36, 40, true, 0);
+        mask_center(&pip_face_thinking, 0, 0, 0xffffff);
+        for (int i = 0; i < 3; i++) dot(152 + i * 36, 44, true, 0);
     } else if (!strcmp(name, "listening")) {
-        mask(&pip_face_listening, 104, 64, 0xffffff);
-        mask(&pip_ears, 331, 98, 0xffffff);
-        mask(&pip_ears_left, 56, 98, 0xffffff);
+        mask_center(&pip_face_listening, 0, 0, 0xffffff);
+        mask(&pip_ears, CENTER + 107, CENTER - 86, 0xffffff);
+        mask(&pip_ears_left, CENTER - 168, CENTER - 86, 0xffffff);
     } else if (!strcmp(name, "sleeping")) {
         pip_sleep_start(scene);
     } else {
-        mask(&pip_face_outline, 104, 64, 0xffffff);
-        mask(&pip_eye_happy, 160, 140, 0xffffff);
-        mask(&pip_eye_happy, 236, 140, 0xffffff);
-        mask(&pip_smile, 178, 212, 0xffffff);
+        mask_center(&pip_face_outline, 0, 0, 0xffffff);
+        mask(&pip_eye_happy, CENTER - 64, CENTER - 44, 0xffffff);
+        mask(&pip_eye_happy, CENTER + 12, CENTER - 44, 0xffffff);
+        mask(&pip_smile, CENTER - 46, CENTER + 28, 0xffffff);
     }
 }
 
@@ -189,20 +232,20 @@ static int cap_height(const lv_font_t *font)
 
 static void indicators(uint32_t background)
 {
-    unsigned capacity = 9 - option_count;
+    unsigned capacity = ROW_SLOTS - option_count;
     unsigned visible = pages < capacity ? pages : capacity;
     unsigned first = page > capacity / 2 ? page - capacity / 2 : 0;
     if (first + visible > pages) first = pages - visible;
     int x = (WIDTH - (int)(visible + option_count) * 36) / 2 - (option_count ? 2 : 0);
     for (unsigned i = first; i < first + visible; i++, x += 36) {
-        if (option_count) mask(i == page ? &pip_page_full : &pip_page_empty, x + 6, 312, 0xffffff);
-        else dot(x + 6, 312, i == page, background);
+        if (option_count) mask(i == page ? &pip_page_full : &pip_page_empty, x + 6, ROW_CY - 12, 0xffffff);
+        else dot(x + 6, ROW_CY - 12, i == page, background);
     }
     for (unsigned i = 0; i < option_count; i++, x += 36) {
         bool active = page == pages + i;
-        if (active) box(scene, x, 306, 36, 36, 0xffffff, LV_RADIUS_CIRCLE);
+        if (active) box(scene, x, ROW_CY - 18, 36, 36, 0xffffff, LV_RADIUS_CIRCLE);
         char letter[] = {(char)('A' + i), 0};
-        lv_obj_t *label = text_at(scene, letter, x, 324 - cap_height(&inter_choice) / 2,
+        lv_obj_t *label = text_at(scene, letter, x, ROW_CY - cap_height(&inter_choice) / 2,
             36, &inter_choice, active ? background : 0xffffff);
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
     }
@@ -220,16 +263,16 @@ static void option_text(const char *text)
         unsigned offset = 0;
         lines = 0;
         while (text[offset]) {
-            uint32_t length = lv_text_get_next_line(text + offset, font, 0, 352, NULL, LV_TEXT_FLAG_NONE);
+            uint32_t length = lv_text_get_next_line(text + offset, font, 0, CHOICE_TEXT_W, NULL, LV_TEXT_FLAG_NONE);
             if (!length) break;
             offset += length;
             lines++;
         }
         if (!lines) lines = 1;
-        if ((int)(lines - 1) * line_height + cap_height(font) <= 208) break;
+        if ((int)(lines - 1) * line_height + cap_height(font) <= CHOICE_TEXT_H) break;
     }
     int height = (int)(lines - 1) * line_height + cap_height(font);
-    if (height > 208 && strchr(text, '\n')) {
+    if (height > CHOICE_TEXT_H && strchr(text, '\n')) {
         // Excess explicit line breaks must not hide part of an option.
         char compact[65];
         snprintf(compact, sizeof(compact), "%s", text);
@@ -237,7 +280,8 @@ static void option_text(const char *text)
         option_text(compact);
         return;
     }
-    lv_obj_t *label = text_at(scene, text, 48, 24 + (256 - height) / 2, 352, font, 0);
+    lv_obj_t *label = text_at(scene, text, CENTER - CHOICE_TEXT_W / 2, CHOICE_CY - height / 2, CHOICE_TEXT_W, font, 0);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_line_space(label, line_height - font->line_height, 0);
 }
 
@@ -253,25 +297,25 @@ static void render_page(void)
         memcpy(text, content + offsets[page], size);
         while (size && (text[size - 1] == ' ' || text[size - 1] == '\n')) size--;
         text[size] = 0;
-        text_at(scene, text, 40, 40, 368, &inter_55, 0xffffff);
+        text_at(scene, text, TEXT_X, TEXT_Y, TEXT_W, &inter_55, 0xffffff);
     } else if (option_count && !confirming) {
         snprintf(state, sizeof(state), "choice");
-        box(scene, 24, 24, 400, 256, 0xffffff, page == pages ? 32 : 34);
+        box(scene, CENTER - CHOICE_D / 2, CHOICE_CY - CHOICE_D / 2, CHOICE_D, CHOICE_D, 0xffffff, LV_RADIUS_CIRCLE);
         option_text(option_labels[page - pages]);
     } else if (option_count) {
         snprintf(state, sizeof(state), "confirm");
-        box(scene, 128, 56, 192, 192, 0xffffff, LV_RADIUS_CIRCLE);
-        lv_obj_t *check = text_at(scene, "✓", 192, 110, 64, &inter_check, 0);
+        box(scene, CENTER - CONFIRM_D / 2, CHOICE_CY - CONFIRM_D / 2, CONFIRM_D, CONFIRM_D, 0xffffff, LV_RADIUS_CIRCLE);
+        lv_obj_t *check = text_at(scene, "✓", CENTER - 32, CHOICE_CY - 42, 64, &inter_check, 0);
         lv_obj_set_style_text_align(check, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_line_space(check, 0, 0);
         lv_label_set_long_mode(check, LV_LABEL_LONG_CLIP);
-        text_at(scene, "Confirm", 182, 186, 100, &inter_confirm, 0);
-        lv_obj_t *left = text_at(scene, "←", 42, 132, 60, &inter_arrows, 0xffffff);
-        lv_obj_t *right = text_at(scene, "→", 356, 132, 60, &inter_arrows, 0xffffff);
+        text_at(scene, "Confirm", CENTER - 42, CHOICE_CY + 34, 100, &inter_confirm, 0);
+        lv_obj_t *left = text_at(scene, "←", 26, CHOICE_CY - 20, 60, &inter_arrows, 0xffffff);
+        lv_obj_t *right = text_at(scene, "→", WIDTH - 86, CHOICE_CY - 20, 60, &inter_arrows, 0xffffff);
         lv_obj_set_style_text_opa(left, LV_OPA_50, 0);
         lv_obj_set_style_text_opa(right, LV_OPA_50, 0);
     } else {
-        lv_obj_t *button = box(scene, 161, 104, 128, 128, 0xffffff, LV_RADIUS_CIRCLE);
+        lv_obj_t *button = box(scene, CENTER - DISMISS_D / 2, CHOICE_CY - DISMISS_D / 2, DISMISS_D, DISMISS_D, 0xffffff, LV_RADIUS_CIRCLE);
         lv_obj_t *label = lv_label_create(button);
         lv_obj_set_style_text_font(label, &inter_check, 0);
         lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
@@ -303,19 +347,22 @@ static void submit(unsigned index)
     face("thinking");
 }
 
+// 1 = Retry, 2 = Exit, 3 = Submit.
+static void tune_activate(unsigned action)
+{
+    snprintf(tune_action_id, sizeof(tune_action_id), "%s", tune_id);
+    atomic_store(&tune_action, action);
+    if (action == 2) { *tune_id = 0; face("idle"); }
+    else snprintf(state, sizeof(state), "tune_wait");
+}
+
 static void tap(int x, int y)
 {
     idle_activity();
     if (*tune_id && !strcmp(state, "tune_review")) {
-        unsigned action = 0;
-        if (x >= 24 && x < 212 && y >= 24 && y < 172) action = 1;
-        else if (x >= 24 && x < 212 && y >= 196 && y < 344) action = 2;
-        else if (x >= 236 && x < 424 && y >= 24 && y < 344) action = 3;
-        if (action) {
-            snprintf(tune_action_id, sizeof(tune_action_id), "%s", tune_id);
-            atomic_store(&tune_action, action);
-            if (action == 2) { *tune_id = 0; face("idle"); }
-            else snprintf(state, sizeof(state), "tune_wait");
+        for (unsigned i = 0; i < 3; i++) {
+            const lv_area_t *a = &tune_boxes[i];
+            if (x >= a->x1 && x <= a->x2 && y >= a->y1 && y <= a->y2) { tune_activate(i == 0 ? 1 : i == 1 ? 2 : 3); break; }
         }
     } else if (*tune_id && !strcmp(state, "tuning")) {
         face("listening");
@@ -330,18 +377,18 @@ static void tap(int x, int y)
     } else if (showing_card() && !submitted) {
         if (option_count && page >= pages) {
             if (confirming) {
-                int dx = x - 224, dy = y - 152;
-                if (dx * dx + dy * dy <= 96 * 96) submit(page - pages);
-                else if (x < 128) navigate(-1);
-                else if (x >= 320) navigate(1);
-            } else if (x >= 24 && x < 424 && y >= 24 && y < 280) {
+                int dx = x - CENTER, dy = y - CHOICE_CY;
+                if (dx * dx + dy * dy <= (CONFIRM_D / 2) * (CONFIRM_D / 2)) submit(page - pages);
+                else if (x < EDGE_L) navigate(-1);
+                else if (x >= EDGE_R) navigate(1);
+            } else if ((x - CENTER) * (x - CENTER) + (y - CHOICE_CY) * (y - CHOICE_CY) <= (CHOICE_D / 2) * (CHOICE_D / 2)) {
                 confirming = true;
                 render_page();
-            } else if (x < 128) navigate(-1);
-            else if (x >= 320) navigate(1);
-        } else if (x < 128 && page) navigate(-1);
-        else if (x >= 320) navigate(1);
-        else if (!option_count && page == pages && x >= 130 && x < 320) submit(0);
+            } else if (x < EDGE_L) navigate(-1);
+            else if (x >= EDGE_R) navigate(1);
+        } else if (x < EDGE_L && page) navigate(-1);
+        else if (x >= EDGE_R) navigate(1);
+        else if (!option_count && page == pages && x >= EDGE_L + 2 && x < EDGE_R) submit(0);
     }
 }
 
@@ -360,7 +407,8 @@ static void pointer_press(int x, int y)
     pressed = (lv_point_t){x, y};
     pointer_down = true;
     attention_pressed = !strcmp(state, "attention");
-    if (!strcmp(state, "sleeping") || !strcmp(state, "idle")) {
+    // Without Wi-Fi the audio task fails at once, which only shows as a red flash.
+    if ((!strcmp(state, "sleeping") || !strcmp(state, "idle")) && pip_network_ready()) {
         recording_hold = true;
         face("listening");
         recording_hold_generation = atomic_load(&audio_state) & ~3u;
@@ -390,7 +438,9 @@ static void pointer_release(int x, int y, bool lost)
 static void pointer_event(lv_event_t *event)
 {
     lv_indev_t *input = lv_event_get_indev(event);
-    if (!input) return;
+    // The dial's presses are delivered to the same object. They have no position;
+    // treating them as touches turned every press into a tap at (0, 0).
+    if (!input || lv_indev_get_type(input) != LV_INDEV_TYPE_POINTER) return;
     lv_point_t point;
     lv_indev_get_point(input, &point);
     if (lv_event_get_code(event) == LV_EVENT_PRESSED) {
@@ -407,9 +457,9 @@ void pip_ui_init(lv_display_t *display)
     lv_obj_t *screen = lv_display_get_screen_active(display);
     lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
-    scene = box(screen, 0, 0, WIDTH, HEIGHT, 0, 56);
-    // All children are inset within the rounded background. Clipping the
-    // children into the rounded corners adds unnecessary offscreen compositing.
+    scene = box(screen, 0, 0, WIDTH, HEIGHT, 0, LV_RADIUS_CIRCLE);
+    // All children are inset within the circular background. Clipping the
+    // children to the circle adds unnecessary offscreen compositing.
     lv_obj_add_flag(scene, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(scene, pointer_event, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(scene, pointer_event, LV_EVENT_RELEASED, NULL);
@@ -444,7 +494,7 @@ int32_t pip_ui_card(const char *title, const char *body, const char *const *labe
     offsets[0] = 0;
     while (content[offset] && pages < 166) {
         for (int line = 0; line < 4 && content[offset]; line++) {
-            offset += lv_text_get_next_line(content + offset, &inter_55, 0, 368, NULL, LV_TEXT_FLAG_NONE);
+            offset += lv_text_get_next_line(content + offset, &inter_55, 0, TEXT_W, NULL, LV_TEXT_FLAG_NONE);
         }
         offsets[++pages] = offset;
     }
@@ -565,4 +615,106 @@ uint32_t pip_ui_tune_action(char *id, uint32_t capacity)
     snprintf(id, capacity, "%s", tune_action_id);
     lvgl_port_unlock();
     return action;
+}
+
+// Rotary dial. The scene is the only focusable object, and the group stays in
+// edit mode so every detent arrives as LV_EVENT_KEY (left/right). A short press
+// is LV_EVENT_SHORT_CLICKED; a long press on idle or sleeping starts recording and
+// the next press stops it.
+static void dial_stop_recording(void)
+{
+    dial_recording = false;
+    if (strcmp(state, "listening")) return;
+    unsigned audio = atomic_load(&audio_state);
+    face("thinking");
+    atomic_store(&audio_state, (audio & ~3u) | 2);
+    atomic_store(&interaction, 2);
+}
+
+static void dial_turn(int direction)
+{
+    idle_activity();
+    if (!strcmp(state, "sleeping")) face("idle");
+    else if (*tune_id && !strcmp(state, "tune_review")) {
+        tune_focus = (tune_focus + (direction > 0 ? 1 : 2)) % 3;
+        face("tune_review");
+    } else if (!strcmp(state, "attention") && pages) render_page();
+    else if (showing_card()) navigate(direction);
+}
+
+static void dial_press(void)
+{
+    idle_activity();
+    if (dial_recording) { dial_stop_recording(); return; }
+    if (!strcmp(state, "sleeping")) { face("idle"); return; }
+    if (*tune_id && !strcmp(state, "tune_review")) {
+        tune_activate(tune_focus == 0 ? 1 : tune_focus == 1 ? 2 : 3);
+    } else if (*tune_id && (!strcmp(state, "tuning") || !strcmp(state, "listening"))) {
+        tap(0, 0);
+    } else if (!strcmp(state, "attention") && pages) {
+        render_page();
+    } else if (showing_card() && !submitted) {
+        if (option_count && page >= pages) {
+            if (confirming) submit(page - pages);
+            else { confirming = true; render_page(); }
+        } else if (page >= pages && !option_count) submit(0);   // text pages: turn, do not press
+    }
+}
+
+static void dial_long_press(void)
+{
+    if (dial_recording || *tune_id || !pip_network_ready() ||
+        (strcmp(state, "sleeping") && strcmp(state, "idle"))) return;
+    idle_activity();
+    face("listening");
+    dial_recording = true;
+    atomic_store(&interaction, 1);
+}
+
+static void dial_log(const char *what)
+{
+    printf("PIPDIAL %s state=%s page=%u/%u confirming=%d submitted=%d recording=%d\n",
+        what, state, page, pages, confirming, submitted, dial_recording);
+}
+
+// Pressing the knob also makes it tick; those turns must not cancel a confirm.
+static bool dial_button_down;
+static uint32_t dial_released_at;
+
+static void dial_event(lv_event_t *event)
+{
+    const lv_event_code_t code = lv_event_get_code(event);
+    // A touch tap makes LVGL focus the scene, which leaves edit mode; without it the
+    // dial's turns never become KEY events. Re-enter it on every event.
+    if (dial_group) lv_group_set_editing(dial_group, true);
+    // Touch taps reach the scene as clicks too; the touch handler already owns them.
+    // KEY events only come from the dial, and their parameter is not an indev.
+    if (code != LV_EVENT_KEY) {
+        lv_indev_t *source = lv_event_get_indev(event);
+        if (source && lv_indev_get_type(source) == LV_INDEV_TYPE_POINTER) return;
+    }
+    switch (code) {
+    case LV_EVENT_KEY: {
+        uint32_t key = lv_event_get_key(event);
+        if (dial_button_down || lv_tick_elaps(dial_released_at) < 300) break;
+        if (key == LV_KEY_RIGHT || key == LV_KEY_DOWN) dial_turn(1);
+        else if (key == LV_KEY_LEFT || key == LV_KEY_UP) dial_turn(-1);
+        break;
+    }
+    case LV_EVENT_SHORT_CLICKED: dial_log("short-click"); dial_press(); dial_log("  ->"); break;
+    case LV_EVENT_LONG_PRESSED: dial_log("long-press"); dial_long_press(); dial_log("  ->"); break;
+    case LV_EVENT_PRESSED: dial_button_down = true; dial_log("pressed"); break;
+    case LV_EVENT_RELEASED: dial_button_down = false; dial_released_at = lv_tick_get(); dial_log("released"); break;
+    default: break;
+    }
+}
+
+void pip_ui_attach_dial(lv_indev_t *dial)
+{
+    if (!dial || dial_group) return;
+    dial_group = lv_group_create();
+    lv_group_add_obj(dial_group, scene);
+    lv_group_set_editing(dial_group, true);
+    lv_indev_set_group(dial, dial_group);
+    lv_obj_add_event_cb(scene, dial_event, LV_EVENT_ALL, NULL);
 }

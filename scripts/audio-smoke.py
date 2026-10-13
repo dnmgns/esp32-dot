@@ -8,6 +8,7 @@ import time
 import subprocess
 import serial
 from serial.tools import list_ports
+import watcher_port
 
 spec = importlib.util.spec_from_file_location('ui', Path(__file__).with_name('ui-smoke.py'))
 ui = importlib.util.module_from_spec(spec)
@@ -27,7 +28,7 @@ def main():
         health = ui.api('/health')
     assert health['connected'] and health['pending'] == 0
     assert ui.api('/audio')['ready'], 'Audio service still warming up'
-    ports = [p.device for p in list_ports.comports() if p.vid == 0x303a and p.pid == 0x1001]
+    ports = watcher_port.candidates()
     assert len(ports) == 1
     with serial.Serial(ports[0], 115200, timeout=.1, dsrdtr=True, rtscts=True) as stream:
         try:

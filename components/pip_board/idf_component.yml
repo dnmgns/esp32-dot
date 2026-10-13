@@ -1,6 +1,11 @@
 dependencies:
     idf: ">=5.5,<5.6"
-    waveshare/esp32_s3_touch_amoled_1_8: "==2.0.3"
     espressif/esp_lvgl_port: "==2.6.2"
     lvgl/lvgl: "==9.2.2"
-
+    # SenseCAP Watcher: SPD2010 QSPI panel + touch, rotary dial, microphone codec.
+    espressif/esp_lcd_spd2010: "==2.0.0~1"
+    espressif/esp_lcd_touch_spd2010: "==2.1.0"
+    espressif/esp_codec_dev: "==1.5.11"
+    espressif/knob: "==1.1.0"
+    # esp_lvgl_port enables its encoder support whenever knob is present and then needs button.
+    espressif/button: "==4.2.1"

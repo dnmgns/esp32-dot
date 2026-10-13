@@ -356,8 +356,8 @@ async def serve(args):
     print(f"Pip API: http://127.0.0.1:{args.http_port}; MCP: http://127.0.0.1:{args.mcp_port}/mcp; device TCP: {args.bind}:{args.tcp_port}", flush=True)
     tasks = [audio.serve_forever(), bridge.audio.worker.start(), tcp.serve_forever(), http.serve_forever(), rpc.serve_forever(), mcp.deliver_events()]
     if args.serial:
-        from serial.tools import list_ports
-        ports = [p.device for p in list_ports.comports() if p.vid == 0x303a and p.pid == 0x1001]
+        import watcher_port
+        ports = watcher_port.candidates()
         port = args.serial if args.serial != "auto" else ports[0] if len(ports) == 1 else None
         if not port:
             raise ValueError("Expected one USB device; specify --serial /dev/cu.usbmodem…")

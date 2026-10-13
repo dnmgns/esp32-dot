@@ -8,6 +8,7 @@ import uuid
 
 import serial
 from serial.tools import list_ports
+import watcher_port
 from screenshot import save_capture
 
 API = 'http://127.0.0.1:8788'
@@ -65,7 +66,7 @@ def main():
     health = api('/health')
     assert health['connected'] and health['transport'] == 'tcp', health
     assert health['pending'] == 0, 'Dismiss the existing cards first; this test never clears user cards'
-    devices = [p.device for p in list_ports.comports() if p.vid == 0x303a and p.pid == 0x1001]
+    devices = watcher_port.candidates()
     assert len(devices) == 1, devices
     OUT.mkdir(parents=True, exist_ok=True)
     with serial.Serial(devices[0], 115200, timeout=0.2, dsrdtr=True, rtscts=True) as stream:

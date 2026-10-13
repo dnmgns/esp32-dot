@@ -7,9 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "esp_lcd_touch.h"
-#include "bsp/esp-bsp.h"
-#include "bsp/display.h"
-#include "bsp/touch.h"
+#include "pip_watcher.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_ops.h"
@@ -18,13 +16,13 @@
 #include "esp_psram.h"
 #include "esp_timer.h"
 #include "esp_rom_crc.h"
-#include "driver/usb_serial_jtag.h"
-#include "driver/usb_serial_jtag_vfs.h"
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
 #include "lvgl.h"
 
 static const char *TAG = "pip";
 static lv_display_t *ui_display;
-static esp_lcd_panel_io_handle_t panel_io;
+static lv_indev_t *dial;
 static uint16_t *screen_pixels;
 static uint32_t screen_flushes;
 enum { CONFIGURED_BRIGHTNESS = 80, SLEEP_BRIGHTNESS = 20 };
@@ -35,7 +33,7 @@ void pip_display_sleep(uint32_t sleeping)
 {
     uint32_t percent = sleeping ? SLEEP_BRIGHTNESS : CONFIGURED_BRIGHTNESS;
     if (percent == display_brightness) return;
-    esp_err_t result = bsp_display_brightness_set(percent);
+    esp_err_t result = pip_watcher_backlight_set(percent);
     if (result == ESP_OK) display_brightness = percent;
     else ESP_LOGE(TAG, "Brightness update failed: %s", esp_err_to_name(result));
 }
@@ -96,7 +94,7 @@ static void report_render(void)
 }
 static lv_obj_t *choice_buttons[3];
 static atomic_uint choice;
-enum { UI_WIDTH = BSP_LCD_V_RES, UI_HEIGHT = BSP_LCD_H_RES };
+enum { UI_WIDTH = PIP_LCD_H_RES, UI_HEIGHT = PIP_LCD_V_RES };
 LV_FONT_DECLARE(inter_28);
 LV_FONT_DECLARE(inter_20);
 
@@ -116,99 +114,42 @@ static void capture_flush(lv_event_t *event)
 
 static void round_area(lv_event_t *event)
 {
-    // Both panel variants require even starting coordinates and pixel counts.
+    // The SPD2010 QSPI path needs x ranges that start on a multiple of 4 and
+    // end on 4N+3 (Seeed's bsp_lvgl_rounder_cb). Rows are unconstrained.
     lv_area_t *area = lv_event_get_param(event);
-    area->x1 &= ~1;
-    area->y1 &= ~1;
-    area->x2 |= 1;
-    area->y2 |= 1;
-}
-
-// Waveshare's V2 Arduino reference programs panel controls AFTER sleep-out.
-// The BSP instead programs them while asleep; replay the reference order.
-static esp_err_t panel_wake(void)
-{
-    // The V2 reference also requires 200 ms after software reset (BSP: 80 ms).
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(panel_io, 0x02000100, NULL, 0), TAG, "panel software reset");
-    vTaskDelay(pdMS_TO_TICKS(200));
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(panel_io, 0x02001100, NULL, 0), TAG, "panel sleep out");
-    vTaskDelay(pdMS_TO_TICKS(120));
-    const uint8_t settings[][2] = {
-        {0xfe, 0x00}, {0xc4, 0x80}, {0x3a, 0x55}, {0x53, 0x20}, {0x63, 0xff},
-    };
-    for (unsigned i = 0; i < sizeof(settings) / sizeof(settings[0]); i++) {
-        ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(panel_io,
-            0x02000000 | (settings[i][0] << 8), &settings[i][1], 1), TAG, "panel control");
-    }
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(panel_io, 0x02002900, NULL, 0), TAG, "panel display on");
-    const uint8_t brightness = 255 * SLEEP_BRIGHTNESS / 100;
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(panel_io, 0x02005100, &brightness, 1), TAG, "panel brightness");
-    const uint8_t contrast = 0;
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(panel_io, 0x02005800, &contrast, 1), TAG, "panel contrast");
-    vTaskDelay(pdMS_TO_TICKS(10));
-    return ESP_OK;
-}
-
-static void panel_report(void)
-{
-    if (!lvgl_port_lock(1000)) return;
-    const uint8_t registers[] = {0x04, 0x0a, 0x0b, 0x0c, 0x52, 0x54};
-    for (unsigned i = 0; i < sizeof(registers); i++) {
-        uint8_t data[4] = {0};
-        esp_err_t result = esp_lcd_panel_io_rx_param(panel_io,
-            0x03000000 | (registers[i] << 8), data, sizeof(data));
-        printf("PIPPANEL %02x result=%ld raw=%02x%02x%02x%02x\n", registers[i],
-            (long)result, data[0], data[1], data[2], data[3]);
-    }
-    lvgl_port_unlock();
+    area->x1 &= ~3;
+    area->x2 |= 3;
 }
 
 int32_t pip_board_init(void)
 {
-    ESP_RETURN_ON_ERROR(bsp_i2c_init(), TAG, "I2C initialization");
-    // Probe touch BEFORE creating the panel: BSP selects the revision's X gap.
-    // The BSP returns an error when neither known controller responds.
-    esp_lcd_touch_handle_t touch = NULL;
-    ESP_RETURN_ON_ERROR(bsp_touch_new(NULL, &touch), TAG, "touch/revision detection");
-
+    ESP_RETURN_ON_ERROR(pip_watcher_power_init(), TAG, "board power");
     esp_lcd_panel_handle_t panel = NULL;
     esp_lcd_panel_io_handle_t io = NULL;
-    const bsp_display_config_t panel_config = {0};
-    ESP_RETURN_ON_ERROR(bsp_display_new(&panel_config, &panel, &io), TAG, "panel initialization");
-    panel_io = io;
-    if (i2c_master_probe(bsp_i2c_get_handle(), 0x15, 100) == ESP_OK) {
-        ESP_RETURN_ON_ERROR(panel_wake(), TAG, "V2 panel wake sequence");
-    } else {
-        vTaskDelay(pdMS_TO_TICKS(30));
-        ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(panel, true), TAG, "display on");
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    // Software rotation skips the port's normal panel orientation setup.
-    // Explicitly restore native addressing after the panel has woken up.
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(panel, false), TAG, "native panel axes");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(panel, false, false), TAG, "native panel orientation");
-    ESP_RETURN_ON_ERROR(bsp_display_brightness_set(SLEEP_BRIGHTNESS), TAG, "brightness");
+    ESP_RETURN_ON_ERROR(pip_watcher_display_new(&panel, &io), TAG, "panel initialization");
+    ESP_RETURN_ON_ERROR(pip_watcher_backlight_set(SLEEP_BRIGHTNESS), TAG, "brightness");
+    esp_lcd_touch_handle_t touch = NULL;
+    ESP_RETURN_ON_ERROR(pip_watcher_touch_new(&touch), TAG, "touch initialization");
 
     lvgl_port_cfg_t port_config = ESP_LVGL_PORT_INIT_CONFIG();
     port_config.task_stack = 6144;
     ESP_RETURN_ON_ERROR(lvgl_port_init(&port_config), TAG, "LVGL initialization");
-    // Create the display, configure rotation, and build the first scene atomically.
+    // Create the display and build the first scene atomically.
     ESP_RETURN_ON_FALSE(lvgl_port_lock(1000), ESP_ERR_TIMEOUT, TAG, "LVGL initialization lock");
     const lvgl_port_display_cfg_t display_config = {
         .io_handle = io,
         .panel_handle = panel,
-        .buffer_size = BSP_LCD_H_RES * 32,
+        .buffer_size = PIP_LCD_H_RES * 32,
         .double_buffer = true,
-        .hres = BSP_LCD_H_RES,
-        .vres = BSP_LCD_V_RES,
+        .hres = PIP_LCD_H_RES,
+        .vres = PIP_LCD_V_RES,
         .color_format = LV_COLOR_FORMAT_RGB565,
         .flags = {
             .buff_dma = true,
             .swap_bytes = true,
-            .sw_rotate = true,
         },
     };
-    // QSPI panel: use the SPI display port, not the BSP's RGB-display wrapper.
+    // QSPI panel: use the SPI display port. The screen is mounted unrotated.
     lv_display_t *display = lvgl_port_add_disp(&display_config);
     ESP_RETURN_ON_FALSE(display, ESP_ERR_NO_MEM, TAG, "display buffers");
     ui_display = display;
@@ -223,26 +164,24 @@ int32_t pip_board_init(void)
     };
     ESP_RETURN_ON_FALSE(lvgl_port_add_touch(&touch_config), ESP_FAIL, TAG, "touch input");
     lv_display_add_event_cb(display, round_area, LV_EVENT_INVALIDATE_AREA, NULL);
-    // The enclosure mounts the native portrait panel clockwise. The LVGL port
-    // maps this rotation counterclockwise into panel memory (448 x 368 UI).
-    // LVGL applies the inverse transform to the associated touch input.
-    lv_display_set_rotation(display, LV_DISPLAY_ROTATION_90);
+    // Dial: turn = next/previous, press = enter. pip_ui attaches it to a group.
+    dial = pip_watcher_knob_add(display);
+    if (!dial) ESP_LOGW(TAG, "dial input unavailable");
     lv_display_set_antialiasing(display, true);
     lv_obj_t *screen = lv_display_get_screen_active(display);
     lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
     pip_ui_init(display);
-    ESP_LOGI(TAG, "UI=%ldx%ld; landscape, software rotation",
+    if (dial) pip_ui_attach_dial(dial);
+    ESP_LOGI(TAG, "UI=%ldx%ld; round panel, native orientation",
         (long)lv_display_get_horizontal_resolution(display),
         (long)lv_display_get_vertical_resolution(display));
     lvgl_port_unlock();
-    const usb_serial_jtag_driver_config_t usb_config = {
-        .rx_buffer_size = 4096,
-        .tx_buffer_size = 2048,
-    };
-    ESP_RETURN_ON_ERROR(usb_serial_jtag_driver_install(&usb_config), TAG, "USB debug driver");
-    usb_serial_jtag_vfs_use_driver();
+    // The CH342 bridge carries UART0 (console). Take over stdin/stdout with the
+    // interrupt-driven driver so reads are non-blocking and writes are buffered.
+    ESP_RETURN_ON_ERROR(uart_driver_install(UART_NUM_0, 4096, 8192, 0, NULL, 0), TAG, "console driver");
+    uart_vfs_dev_use_driver(UART_NUM_0);
     fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
     return ESP_OK;
 }
@@ -251,7 +190,7 @@ static bool screenshot_write(const char *data, size_t size)
 {
     // Queue whole lines with backpressure. Console printf writes one byte at a
     // time and may silently drop bytes after its short TX timeout.
-    return usb_serial_jtag_write_bytes(data, size, pdMS_TO_TICKS(1000)) == size;
+    return uart_write_bytes(UART_NUM_0, data, size) == (int)size;
 }
 
 static void send_screenshot(void)
@@ -316,8 +255,11 @@ const char *pip_debug_poll(void)
             command[length] = '\0';
             if (!overflow && strcmp(command, "screenshot") == 0) {
                 send_screenshot();
-            } else if (!overflow && strcmp(command, "panel") == 0) {
-                panel_report();
+            } else if (!overflow && strcmp(command, "power-off") == 0) {
+                puts("PIPPOWER off");
+                fflush(stdout);
+                uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(200));
+                pip_watcher_power_off();
             } else if (!overflow && strcmp(command, "network-stats") == 0) {
                 pip_network_inspect();
             } else if (!overflow && strcmp(command, "render-stats") == 0) {

@@ -8,6 +8,7 @@ import statistics
 import time
 import serial
 from serial.tools import list_ports
+import watcher_port
 from screenshot import save_capture
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,7 +27,7 @@ def main():
     assert args.seconds >= 3
     health = ui.api('/health')
     assert health['pending'] == 0, health
-    ports = [p.device for p in list_ports.comports() if p.vid == 0x303a and p.pid == 0x1001]
+    ports = watcher_port.candidates()
     assert len(ports) == 1, ports
     args.output.mkdir(parents=True, exist_ok=True)
     with serial.Serial(ports[0], 115200, timeout=0.1, dsrdtr=True, rtscts=True) as stream:
